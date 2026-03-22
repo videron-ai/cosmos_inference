@@ -142,15 +142,84 @@ A response containing `"no"` (the default `failure_phrase`) triggers the recover
 
 ---
 
-## vLLM server setup
+## Docker setup
 
-Cosmos-Reason2 must be served with video support enabled. Example launch:
+Both the vLLM server and the LeRobot container communicate over a shared Docker network.
+
+### 1. Create the shared network
 
 ```bash
-vllm serve nvidia/Cosmos-Reason2-2B \
-    --dtype auto \
-    --max-model-len 8192 \
-    --limit-mm-per-prompt video=1
+docker network create ai_network
 ```
 
-The script sends video as a base64-encoded H.264 MP4 via the `video_url` content type in the OpenAI-compatible chat API.
+### 2. Start the vLLM server (Cosmos-Reason2)
+
+```bash
+docker run --rm -it \
+  --network ai_network \
+  --shm-size=8g \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --gpus=all \
+  --name my_vllm_server \
+  -e HF_TOKEN=YOUR_TOKEN \
+  -e HF_HOME=/root/.cache/huggingface \
+  -p 8000:8000 \
+  nvcr.io/nvidia/vllm:26.01-py3 \
+  vllm serve "nvidia/Cosmos-Reason2-2B" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.5
+```
+
+### 3. Start the LeRobot container
+
+Mounts your experiments directory, passes through USB cameras and robot serial ports, and joins the same network so it can reach `my_vllm_server` by hostname.
+
+```bash
+xhost +local:docker && \
+docker run \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v ~/.Xauthority:/root/.Xauthority \
+  -v /home/videron/Desktop/Experiments/:/Experiments/ \
+  -v /media/videron/82E5-BB84:/external_drive \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --gpus all \
+  --device=/dev/v4l/by-id/usb-Web_Camera_Web_Camera_240729163401-video-index0:/dev/video0 \
+  --device=/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_94CE9C9F-video-index0:/dev/video1 \
+  --device=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6085173-if00:/dev/follower \
+  --device=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6054973-if00:/dev/leader \
+  -w /Experiments \
+  --ipc host \
+  --network ai_network \
+  -it --rm \
+  lerobot_pi_support
+```
+
+### 4. Run inference inside the container
+
+```bash
+python eval_sync_cosmos.py \
+  --policy.path="/Experiments/pi05_policy/" \
+  --policy.device=cuda \
+  --robot.type=so101_follower \
+  --robot.port=/dev/follower \
+  --robot.id=videron_follower \
+  --robot.cameras="{desk_cam: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}, gripper: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}}" \
+  --robot.calibration_dir=/Experiments \
+  --task="Put all the legos on the table in the blue bowl" \
+  --duration=1000 \
+  --cosmos_enabled=true \
+  --cosmos_camera_key=gripper \
+  --cosmos_server_url=http://my_vllm_server:8000/v1/chat/completions \
+  --cosmos_window_seconds=15 \
+  --policy.compile_model=true \
+  --visualize=true \
+  --compress_images=true
+```
+
+The `--cosmos_server_url` uses the container name `my_vllm_server` as a hostname, which resolves automatically within `ai_network`.
